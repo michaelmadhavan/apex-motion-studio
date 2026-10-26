@@ -1,0 +1,6 @@
+{
+  "name": "Apex Motion Studio",
+  "description": "Browser-based motion graphics studio for creating cinematic animated videos from user images with genuine MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
