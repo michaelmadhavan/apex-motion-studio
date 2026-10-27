@@ -22,9 +22,11 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   downloadUrl,
   aspectRatio,
 }) => {
-  const [resolution, setResolution] = useState<'1080p' | '2K' | '4K'>('1080p');
+  const [resolution, setResolution] = useState<'1080p' | '2K' | '4K' | 'custom'>('1080p');
   const [frameRate, setFrameRate] = useState<number>(30);
   const [bitrateMbps, setBitrateMbps] = useState<number>(18);
+  const [customWidth, setCustomWidth] = useState<number>(1000);
+  const [customHeight, setCustomHeight] = useState<number>(350);
 
   if (!isOpen) return null;
 
@@ -33,7 +35,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     progress.status === 'encoding' ||
     progress.status === 'finalizing';
 
-  const currentDims = getResolutionDimensions(resolution, aspectRatio);
+  const currentDims =
+    resolution === 'custom'
+      ? { width: customWidth, height: customHeight }
+      : getResolutionDimensions(resolution, aspectRatio);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -65,15 +70,20 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 <label className="text-xs font-semibold text-zinc-400 uppercase tracking-wider block mb-2">
                   Resolution Output
                 </label>
-                <div className="grid grid-cols-3 gap-2">
-                  {(['1080p', '2K', '4K'] as const).map((res) => {
-                    const dims = getResolutionDimensions(res, aspectRatio);
+                <div className="grid grid-cols-4 gap-2">
+                  {(['1080p', '2K', '4K', 'custom'] as const).map((res) => {
+                    const dims =
+                      res === 'custom'
+                        ? { width: customWidth, height: customHeight }
+                        : getResolutionDimensions(res, aspectRatio);
                     return (
                       <button
                         key={res}
                         onClick={() => {
                           setResolution(res);
-                          setBitrateMbps(res === '4K' ? 36 : res === '2K' ? 24 : 18);
+                          if (res !== 'custom') {
+                            setBitrateMbps(res === '4K' ? 36 : res === '2K' ? 24 : 18);
+                          }
                         }}
                         className={`p-3 rounded-lg border text-center transition-all ${
                           resolution === res
@@ -81,7 +91,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                             : 'bg-studio-950 border-studio-800 text-zinc-400 hover:border-studio-700'
                         }`}
                       >
-                        <div className="text-sm font-bold">{res}</div>
+                        <div className="text-sm font-bold">{res === 'custom' ? 'Custom' : res}</div>
                         <div className="text-[10px] text-zinc-500 mt-0.5 font-mono">
                           {dims.width} × {dims.height}
                         </div>
@@ -90,6 +100,35 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   })}
                 </div>
               </div>
+
+              {resolution === 'custom' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                    Width (px)
+                    <input
+                      type="number"
+                      min="16"
+                      max="8192"
+                      step="2"
+                      value={customWidth}
+                      onChange={(event) => setCustomWidth(Number(event.target.value))}
+                      className="mt-2 w-full rounded-lg border border-studio-800 bg-studio-950 px-3 py-2 text-sm font-mono text-zinc-200"
+                    />
+                  </label>
+                  <label className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                    Height (px)
+                    <input
+                      type="number"
+                      min="16"
+                      max="8192"
+                      step="2"
+                      value={customHeight}
+                      onChange={(event) => setCustomHeight(Number(event.target.value))}
+                      className="mt-2 w-full rounded-lg border border-studio-800 bg-studio-950 px-3 py-2 text-sm font-mono text-zinc-200"
+                    />
+                  </label>
+                </div>
+              )}
 
               {/* Framerate & Bitrate */}
               <div className="grid grid-cols-2 gap-4">
@@ -134,7 +173,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <div className="p-3 rounded-lg bg-studio-950 border border-studio-800 flex items-start gap-2.5">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
                 <div className="text-xs text-zinc-400 leading-relaxed">
-                  Authentic H.264 video encoding inside an ISO Base Media File Format (<code className="text-zinc-200 font-mono">.mp4</code>). Playable in QuickTime, VLC, Chrome, iOS, and video editors without conversion.
+                  Encoded as H.264 video in an ISO Base Media File Format (<code className="text-zinc-200 font-mono">.mp4</code>), never WebM renamed as MP4. H.264 export depends on browser and device encoder support.
                 </div>
               </div>
             </>
@@ -181,7 +220,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <div>
                 <h3 className="text-sm font-semibold text-white">Video Export Completed!</h3>
                 <p className="text-xs text-zinc-400 mt-1">
-                  Your genuine MP4 video file has been successfully generated and verified.
+                  Your H.264 MP4 file has been successfully finalized and is ready to download.
                 </p>
               </div>
               <a
@@ -218,8 +257,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             </button>
             <button
               onClick={() =>
-                onStartExport({ resolution, frameRate, bitrateMbps, format: 'mp4' })
+                onStartExport({
+                  resolution,
+                  frameRate,
+                  bitrateMbps,
+                  format: 'mp4',
+                  ...(resolution === 'custom' ? { width: customWidth, height: customHeight } : {}),
+                })
               }
+              disabled={isExporting}
               className="px-5 py-2 rounded-lg bg-gradient-to-r from-rose-700 to-burgundy-700 hover:from-rose-600 hover:to-burgundy-600 text-xs font-semibold text-white shadow-md shadow-rose-950/60 transition-all"
             >
               Start Export

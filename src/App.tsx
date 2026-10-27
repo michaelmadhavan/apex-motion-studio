@@ -52,8 +52,15 @@ export const App: React.FC = () => {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
 
   const exportEngineRef = useRef<VideoExportEngine>(new VideoExportEngine());
+  const exportInProgressRef = useRef(false);
   const animationFrameRef = useRef<number | null>(null);
   const lastTimeRef = useRef<number>(performance.now());
+
+  useEffect(() => {
+    return () => {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    };
+  }, [downloadUrl]);
 
   const currentSettings = settingsMap[selectedTemplate];
   const duration = currentSettings.duration || 8;
@@ -212,6 +219,8 @@ export const App: React.FC = () => {
 
   // Genuine MP4 Export Handler
   const handleStartExport = async (exportSettings: ExportSettings) => {
+    if (exportInProgressRef.current) return;
+    exportInProgressRef.current = true;
     setDownloadUrl(null);
     setExportProgress({
       currentFrame: 0,
@@ -220,23 +229,16 @@ export const App: React.FC = () => {
       status: 'rendering',
     });
 
-    const activeElements = images
-      .slice(0, cardCount)
-      .map((img) => img.element)
-      .filter((el): el is HTMLImageElement => Boolean(el && el.complete));
-
-    if (activeElements.length === 0) {
-      setExportProgress({
-        currentFrame: 0,
-        totalFrames: 0,
-        percentage: 0,
-        status: 'error',
-        errorMessage: 'Cannot export video: please provide at least one valid image.',
-      });
-      return;
-    }
-
     try {
+      const activeElements = images
+        .slice(0, cardCount)
+        .map((img) => img.element)
+        .filter((el): el is HTMLImageElement => Boolean(el && el.complete));
+
+      if (activeElements.length === 0) {
+        throw new Error('Cannot export video: please provide at least one valid image.');
+      }
+
       const renderFn = (c: RenderContext) => {
         TemplateRegistry.renderTemplate(selectedTemplate, c, currentSettings);
       };
@@ -252,14 +254,16 @@ export const App: React.FC = () => {
 
       const url = URL.createObjectURL(mp4Blob);
       setDownloadUrl(url);
-    } catch (err: any) {
+    } catch (err) {
       setExportProgress({
         currentFrame: 0,
         totalFrames: 0,
         percentage: 0,
         status: 'error',
-        errorMessage: err.message || 'Export error encountered',
+        errorMessage: err instanceof Error ? err.message : 'Export error encountered',
       });
+    } finally {
+      exportInProgressRef.current = false;
     }
   };
 

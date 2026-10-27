@@ -114,10 +114,12 @@ export interface RenderContext {
 }
 
 export interface ExportSettings {
-  resolution: '1080p' | '2K' | '4K';
+  resolution: '1080p' | '2K' | '4K' | 'custom';
   frameRate: number;
   bitrateMbps: number;
   format: 'mp4';
+  width?: number;
+  height?: number;
 }
 
 export interface ExportProgress {

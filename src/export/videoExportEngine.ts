@@ -2,11 +2,17 @@ import { ExportProgress, ExportSettings, RenderContext, AspectRatioType } from '
 import { getResolutionDimensions } from '../utils/layout';
 import { SimpleMp4Muxer } from './mp4Muxer';
 
+type WebCodecsWindow = Window & {
+  VideoEncoder?: any;
+  VideoFrame?: any;
+};
+
 export class VideoExportEngine {
   private isCancelled = false;
+  private isExporting = false;
 
   public cancel() {
-    this.isCancelled = true;
+    if (this.isExporting) this.isCancelled = true;
   }
 
   public async exportMP4(
@@ -17,289 +23,239 @@ export class VideoExportEngine {
     durationSeconds: number,
     onProgress: (p: ExportProgress) => void
   ): Promise<Blob> {
-    this.isCancelled = false;
-
-    const { width, height } = getResolutionDimensions(settings.resolution, aspectRatio);
-    const fps = settings.frameRate || 30;
-    const totalFrames = Math.max(1, Math.round(durationSeconds * fps));
-
-    // Try Path 1: WebCodecs VideoEncoder with ISO BMFF MP4 Muxer (Pure frame-by-frame deterministic rendering)
-    if (typeof (window as any).VideoEncoder === 'function') {
-      try {
-        return await this.exportWithWebCodecs(
-          renderFrameFn,
-          images,
-          settings,
-          aspectRatio,
-          durationSeconds,
-          width,
-          height,
-          fps,
-          totalFrames,
-          onProgress
-        );
-      } catch (err: any) {
-        if (this.isCancelled) throw err;
-        console.warn('WebCodecs encoder encountered an issue, checking genuine MP4 MediaRecorder...', err);
-        // Fall through to Path 2 if available
-      }
+    if (this.isExporting) {
+      throw new Error('An export is already in progress');
     }
 
-    // Path 2: MediaRecorder with native MP4 container
-    if (typeof window.MediaRecorder === 'function' && window.MediaRecorder.isTypeSupported('video/mp4')) {
-      return await this.exportWithMediaRecorder(
-        renderFrameFn,
-        images,
-        settings,
-        aspectRatio,
-        durationSeconds,
+    this.isExporting = true;
+    this.isCancelled = false;
+    let exportCanvas: HTMLCanvasElement | null = null;
+
+    try {
+      const { width, height } =
+        settings.resolution === 'custom'
+          ? { width: settings.width, height: settings.height }
+          : getResolutionDimensions(settings.resolution, aspectRatio);
+      if (typeof width !== 'number' || typeof height !== 'number') {
+        throw new Error('Custom video width and height are required.');
+      }
+      this.validateSettings(width, height, settings.frameRate, settings.bitrateMbps, durationSeconds);
+
+      const videoCodecs = window as WebCodecsWindow;
+      const VideoEncoderClass = videoCodecs.VideoEncoder;
+      const VideoFrameClass = videoCodecs.VideoFrame;
+      if (
+        typeof VideoEncoderClass !== 'function' ||
+        typeof VideoEncoderClass.isConfigSupported !== 'function' ||
+        typeof VideoFrameClass !== 'function'
+      ) {
+        throw new Error(
+          'MP4 export is unavailable in this browser. Use a recent Chrome or Edge build, or another browser/device that supports WebCodecs H.264.'
+        );
+      }
+
+      const fps = settings.frameRate;
+      const frameCount = Math.round(durationSeconds * fps);
+      const totalFrames = Math.max(1, frameCount);
+      const bitrate = Math.round(settings.bitrateMbps * 1_000_000);
+      const offCanvas = document.createElement('canvas');
+      exportCanvas = offCanvas;
+      offCanvas.width = width;
+      offCanvas.height = height;
+      const ctx = offCanvas.getContext('2d', { alpha: false });
+      if (!ctx) throw new Error('Could not create the export canvas context');
+
+      const muxer = new SimpleMp4Muxer({
+        width,
+        height,
+        timescale: 1_000_000,
+        defaultFrameDuration: Math.round(1_000_000 / fps),
+      });
+      let callbackError: Error | null = null;
+      const encoderConfig = await this.getSupportedEncoderConfig(
+        VideoEncoderClass,
         width,
         height,
         fps,
-        totalFrames,
-        onProgress
+        bitrate
       );
-    }
+      const encoder = new VideoEncoderClass({
+        output: (chunk: any, metadata: any) => {
+          try {
+            const description = metadata?.decoderConfig?.description;
+            if (description) muxer.setVideoDecoderConfig(description);
+            muxer.addVideoChunk(chunk);
+          } catch (error) {
+            callbackError = error instanceof Error ? error : new Error(String(error));
+          }
+        },
+        error: (error: Error) => {
+          callbackError = error instanceof Error ? error : new Error(String(error));
+        },
+      });
 
-    // If genuine MP4 is completely unavailable on this engine
-    throw new Error(
-      'Genuine MP4 hardware encoding requires standard WebCodecs or MP4 MediaRecorder (supported in Google Chrome, Microsoft Edge, Brave, Opera, and Safari 16.4+). WebM conversion was rejected to ensure authentic MP4 video integrity.'
-    );
-  }
-
-  private async exportWithWebCodecs(
-    renderFrameFn: (ctx: RenderContext) => void,
-    images: HTMLImageElement[],
-    settings: ExportSettings,
-    aspectRatio: AspectRatioType,
-    durationSeconds: number,
-    width: number,
-    height: number,
-    fps: number,
-    totalFrames: number,
-    onProgress: (p: ExportProgress) => void
-  ): Promise<Blob> {
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = width;
-    offCanvas.height = height;
-    const ctx = offCanvas.getContext('2d', { alpha: false });
-    if (!ctx) throw new Error('Could not create offscreen 2D canvas context');
-
-    const muxer = new SimpleMp4Muxer({ width, height });
-    let encoderError: Error | null = null;
-
-    const VideoEncoderClass = (window as any).VideoEncoder;
-    const VideoFrameClass = (window as any).VideoFrame;
-
-    const encoder = new VideoEncoderClass({
-      output: (chunk: any, metadata: any) => {
-        if (metadata?.decoderConfig?.description) {
-          muxer.setVideoDecoderConfig(metadata.decoderConfig.description);
-        }
-        muxer.addVideoChunk(chunk);
-      },
-      error: (e: any) => {
-        console.error('VideoEncoder error:', e);
-        encoderError = e instanceof Error ? e : new Error(String(e));
-      },
-    });
-
-    const bitrate = (settings.bitrateMbps || (settings.resolution === '4K' ? 35 : 18)) * 1_000_000;
-
-    // AVC level selection based on resolution
-    const codecCandidates = [
-      settings.resolution === '4K' ? 'avc1.640033' : 'avc1.4d002a', // High/Main profile
-      'avc1.42001f', // Baseline profile
-      'avc1.42001e',
-    ];
-
-    let configured = false;
-    for (const codec of codecCandidates) {
       try {
-        encoder.configure({
-          codec,
-          width,
-          height,
-          bitrate,
-          framerate: fps,
-          avc: { format: 'avc' },
-        });
-        configured = true;
-        break;
-      } catch (e) {
-        // Continue to fallback codec
-      }
-    }
+        encoder.configure(encoderConfig);
 
-    if (!configured) {
-      throw new Error('No compatible H.264 video codec found on this device');
-    }
-
-    onProgress({
-      currentFrame: 0,
-      totalFrames,
-      percentage: 0,
-      status: 'rendering',
-    });
-
-    const frameDurationMicros = Math.round(1_000_000 / fps);
-
-    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-      if (this.isCancelled) {
-        encoder.close();
-        throw new Error('Export cancelled by user');
-      }
-
-      if (encoderError) {
-        encoder.close();
-        throw encoderError;
-      }
-
-      const currentTime = frameIndex / fps;
-      const progress = durationSeconds > 0 ? currentTime / durationSeconds : 0;
-
-      // Render exact frame
-      renderFrameFn({
-        ctx,
-        width,
-        height,
-        images,
-        time: currentTime,
-        progress,
-        aspectRatio,
-      });
-
-      // Construct VideoFrame
-      const videoFrame = new VideoFrameClass(offCanvas, {
-        timestamp: frameIndex * frameDurationMicros,
-        duration: frameDurationMicros,
-      });
-
-      const isKeyframe = frameIndex % (fps * 2) === 0;
-      encoder.encode(videoFrame, { keyFrame: isKeyframe });
-      videoFrame.close();
-
-      // Yield event loop every 4 frames so UI stays responsive and updates progress
-      if (frameIndex % 4 === 0 || frameIndex === totalFrames - 1) {
         onProgress({
-          currentFrame: frameIndex + 1,
+          currentFrame: 0,
           totalFrames,
-          percentage: Math.round(((frameIndex + 1) / totalFrames) * 90),
+          percentage: 0,
           status: 'rendering',
         });
-        await new Promise((r) => setTimeout(r, 0));
-      }
-    }
 
-    onProgress({
-      currentFrame: totalFrames,
-      totalFrames,
-      percentage: 95,
-      status: 'finalizing',
-    });
+        for (let frameIndex = 0; frameIndex < totalFrames; frameIndex += 1) {
+          this.throwIfCancelled();
+          this.throwIfEncoderFailed(callbackError);
 
-    await encoder.flush();
-    encoder.close();
+          const timestamp = Math.round((frameIndex * 1_000_000) / fps);
+          const nextTimestamp = Math.round(((frameIndex + 1) * 1_000_000) / fps);
+          const currentTime = timestamp / 1_000_000;
 
-    const mp4Blob = muxer.finalize();
-    if (mp4Blob.size < 1000) {
-      throw new Error('Generated MP4 file is empty or corrupted');
-    }
+          renderFrameFn({
+            ctx,
+            width,
+            height,
+            images,
+            time: currentTime,
+            progress: Math.min(1, currentTime / durationSeconds),
+            aspectRatio,
+          });
 
-    onProgress({
-      currentFrame: totalFrames,
-      totalFrames,
-      percentage: 100,
-      status: 'completed',
-    });
+          const videoFrame = new VideoFrameClass(offCanvas, {
+            timestamp,
+            duration: nextTimestamp - timestamp,
+          });
+          try {
+            encoder.encode(videoFrame, { keyFrame: frameIndex % (fps * 2) === 0 });
+          } finally {
+            videoFrame.close();
+          }
 
-    return mp4Blob;
-  }
-
-  private async exportWithMediaRecorder(
-    renderFrameFn: (ctx: RenderContext) => void,
-    images: HTMLImageElement[],
-    settings: ExportSettings,
-    aspectRatio: AspectRatioType,
-    durationSeconds: number,
-    width: number,
-    height: number,
-    fps: number,
-    totalFrames: number,
-    onProgress: (p: ExportProgress) => void
-  ): Promise<Blob> {
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = width;
-    offCanvas.height = height;
-    const ctx = offCanvas.getContext('2d', { alpha: false });
-    if (!ctx) throw new Error('Could not create offscreen canvas');
-
-    const stream = offCanvas.captureStream(fps);
-    const recordedChunks: Blob[] = [];
-
-    const recorder = new MediaRecorder(stream, {
-      mimeType: 'video/mp4',
-      videoBitsPerSecond: (settings.bitrateMbps || 18) * 1_000_000,
-    });
-
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        recordedChunks.push(e.data);
-      }
-    };
-
-    recorder.start();
-
-    const intervalMs = 1000 / fps;
-
-    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-      if (this.isCancelled) {
-        recorder.stop();
-        throw new Error('Export cancelled by user');
-      }
-
-      const currentTime = frameIndex / fps;
-      const progress = durationSeconds > 0 ? currentTime / durationSeconds : 0;
-
-      renderFrameFn({
-        ctx,
-        width,
-        height,
-        images,
-        time: currentTime,
-        progress,
-        aspectRatio,
-      });
-
-      if (frameIndex % 5 === 0) {
-        onProgress({
-          currentFrame: frameIndex + 1,
-          totalFrames,
-          percentage: Math.round(((frameIndex + 1) / totalFrames) * 92),
-          status: 'rendering',
-        });
-      }
-
-      await new Promise((r) => setTimeout(r, intervalMs));
-    }
-
-    return new Promise((resolve, reject) => {
-      recorder.onstop = () => {
-        const blob = new Blob(recordedChunks, { type: 'video/mp4' });
-        if (blob.size < 1000) {
-          reject(new Error('MediaRecorder MP4 output was too small'));
-          return;
+          if ((frameIndex + 1) % 4 === 0 || frameIndex === totalFrames - 1) {
+            onProgress({
+              currentFrame: frameIndex + 1,
+              totalFrames,
+              percentage: Math.round(((frameIndex + 1) / totalFrames) * 90),
+              status: 'encoding',
+            });
+            await encoder.flush();
+            this.throwIfCancelled();
+            this.throwIfEncoderFailed(callbackError);
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          }
         }
+
+        onProgress({
+          currentFrame: totalFrames,
+          totalFrames,
+          percentage: 95,
+          status: 'finalizing',
+        });
+
+        await encoder.flush();
+        this.throwIfCancelled();
+        this.throwIfEncoderFailed(callbackError);
+        const mp4Blob = muxer.finalize();
+        if (mp4Blob.type !== 'video/mp4' || mp4Blob.size === 0) {
+          throw new Error('MP4 finalization did not produce a non-empty MP4 file');
+        }
+
         onProgress({
           currentFrame: totalFrames,
           totalFrames,
           percentage: 100,
           status: 'completed',
         });
-        resolve(blob);
+        return mp4Blob;
+      } finally {
+        if (encoder.state !== 'closed') encoder.close();
+      }
+    } finally {
+      if (exportCanvas) {
+        exportCanvas.width = 0;
+        exportCanvas.height = 0;
+      }
+      this.isExporting = false;
+      this.isCancelled = false;
+    }
+  }
+
+  private validateSettings(
+    width: number | undefined,
+    height: number | undefined,
+    fps: number,
+    bitrateMbps: number,
+    durationSeconds: number
+  ) {
+    if (
+      typeof width !== 'number' ||
+      typeof height !== 'number' ||
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width < 16 ||
+      height < 16 ||
+      width > 8192 ||
+      height > 8192 ||
+      width % 2 !== 0 ||
+      height % 2 !== 0 ||
+      width * height > 33_554_432
+    ) {
+      throw new Error('Video dimensions must be even integers between 16 and 8192 pixels, with at most 8K UHD total pixels.');
+    }
+    if (fps !== 30 && fps !== 60) {
+      throw new Error('Frame rate must be either 30 or 60 FPS.');
+    }
+    if (!Number.isFinite(bitrateMbps) || bitrateMbps < 1 || bitrateMbps > 60) {
+      throw new Error('Target bitrate must be between 1 and 60 Mbps.');
+    }
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      throw new Error('Animation duration must be greater than zero.');
+    }
+  }
+
+  private async getSupportedEncoderConfig(
+    VideoEncoderClass: any,
+    width: number,
+    height: number,
+    framerate: number,
+    bitrate: number
+  ): Promise<Record<string, unknown>> {
+    const level = width * height >= 3_000_000
+      ? (framerate > 30 ? '34' : '33')
+      : '2a';
+    const codecs = width * height >= 3_000_000
+      ? [`avc1.6400${level}`, `avc1.4d00${level}`]
+      : [`avc1.4d00${level}`, `avc1.4200${level}`, 'avc1.42001f'];
+
+    for (const codec of codecs) {
+      const config = {
+        codec,
+        width,
+        height,
+        bitrate,
+        framerate,
+        latencyMode: 'realtime',
+        avc: { format: 'avc' },
       };
-      recorder.onerror = (e) => reject(e);
-      recorder.stop();
-    });
+      try {
+        const support = await VideoEncoderClass.isConfigSupported(config);
+        if (support.supported) return support.config ?? config;
+      } catch {
+        // Continue checking other H.264 profiles supported by the browser.
+      }
+    }
+
+    throw new Error(
+      `This browser or device cannot encode H.264 at ${width} × ${height} and ${framerate} FPS. Try a lower resolution or a browser with hardware H.264 WebCodecs support.`
+    );
+  }
+
+  private throwIfCancelled() {
+    if (this.isCancelled) throw new Error('Export cancelled by user');
+  }
+
+  private throwIfEncoderFailed(error: Error | null) {
+    if (error) throw error;
   }
 }
